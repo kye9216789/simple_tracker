@@ -5,7 +5,7 @@ from mmdet.datasets import get_dataset
 from mmdet.apis import (train_detector, init_dist, get_root_logger,
                         set_random_seed)
 from mmcv.runner import load_checkpoint, parallel_test, obj_from_dict
-from mmdet.models import build_detector
+from mmdet.models import build_detector, builder
 from mmdet.datasets import build_dataloader
 from mmcv.parallel import scatter, collate, MMDataParallel
 from mmdet.core import bbox2roi, bbox2result, build_assigner, build_sampler
@@ -16,52 +16,67 @@ import torch.nn as nn
 import sys
 import os
 import glob
+import numpy as np
 
 mmdet_dir = '/home/ye/github/mp_mmdetection/'
 work_dir = 'work_dirs/190604_retinanet_x101_32x4d_fpn_1x'
-sys.path.append(os.path.abspath(mmdet_dir))
-from mmdet.models import builder
 
 
 class Flatten(nn.Module):
+    def __init__(self, seq_len, batch_size):
+        super(Flatten, self).__init__()
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+
     def forward(self, input):
-        return input.view(1, -1)
-    
+        return input.view(self.batch_size, self.seq_len, -1)
+
 
 class Tracker(nn.Module):
     def __init__(self, cfg):
         super(Tracker, self).__init__()
+        self.batch_size = 5
         self.cnn_module = TrackerCnnModule(cfg)
-        self.rnn_module = TrackerRnnModule(256*49, 500, 1).cuda() # TODO : save variable in config
-        
-    def forward(self, img, img_meta):
-        bbox_feats = self.cnn_module(img, img_meta)
-        pred = self.rnn_module(bbox_feats)
-        return pred
+        self.rnn_module = TrackerRnnModule(256*49, 500, self.batch_size).cuda() # TODO : save variable in config
+        self.batch_input = self.init_batch_input()
+        self.softmax = nn.Softmax()
 
+    def forward(self, imgs, bbox_pred):
+        bbox_feats = self.cnn_module(imgs, bbox_pred)
+        bbox_feats = torch.unsqueeze(bbox_feats, 0)
+        self.batch_input = torch.cat((self.batch_input, bbox_feats))
+
+        if self.batch_input.size(0) == self.batch_size:
+            pred = self.rnn_module(self.batch_input)
+            self.batch_input = self.init_batch_input()
+            return self.softmax(pred)
+
+    def init_batch_input(self):
+        return torch.Tensor().cuda()
 
 class TrackerRnnModule(nn.Module):
-    def __init__(self, input_dim, hidden_dim, batch_size, output_dim=1,
+    def __init__(self, input_dim, hidden_dim, batch_size, seq_len=3, output_dim=2,
                     num_layers=2):
         super(TrackerRnnModule, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
         self.num_layers = num_layers
+        self.seq_len = seq_len
 
+        self.flatten = Flatten(self.seq_len, self.batch_size) # [batch, 3, 256, 7, 7] => [batch, 3, 256 * 7 * 7]
         self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, self.num_layers)
-
         self.linear = nn.Linear(self.hidden_dim, output_dim)
-        
+
     def init_hidden(self):
-        return (torch.zeros(self.num_layers, self.batch_size, self.hidden_dim),
-                torch.zeros(self.num_layers, self.batch_size, self.hidden_dim))
-        
+        return (torch.zeros(self.num_layers, self.batch_size, self.hidden_dim) * num_layers)
+
     def forward(self, input):
-        lstm_out, self.hidden = self.lstm(input.view(len(input), self.batch_size, -1))
+        input = self.flatten(input)
+        lstm_out, self.hidden = self.lstm(input.view(input.size(1), input.size(0), -1))
         pred = self.linear(lstm_out[-1].view(self.batch_size, -1))
-        return pred.view(-1)
-    
+        return pred.view(self.batch_size, -1)
+
 
 class TrackerCnnModule(nn.Module):
     def __init__(self, cfg):
@@ -77,28 +92,26 @@ class TrackerCnnModule(nn.Module):
             param.requires_grad = False
 
         self.detector = model.module
-        self.flatten = Flatten()
         self.cfg = cfg
-        
-    def forward(self, img, img_meta, rescale=False):
+
+    def forward(self, img, bbox_pred, rescale=False):
         x = self.detector.extract_feat(img)
-        outs = self.detector.bbox_head(x)
-        bbox_inputs = outs + (img_meta, cfg.test_cfg, rescale)
-        bboxes, cls = self.detector.bbox_head.get_bboxes(*bbox_inputs)[0]
-        rois = bbox2roi([bboxes])
-        bbox_feats = self.bbox_roi_extractor(x[:self.bbox_roi_extractor.num_inputs], rois)[0]
-        bbox_feats = self.flatten(bbox_feats)
+
+        rois = bbox2roi([bbox for bbox in bbox_pred])
+        bbox_feats = self.bbox_roi_extractor(x[:self.bbox_roi_extractor.num_inputs], rois)
         return bbox_feats
 
-    
+
 cfg = Config.fromfile(glob.glob(os.path.join(mmdet_dir, work_dir, '*.py'))[0])
 cfg.work_dir = work_dir
 cfg.mmdet_dir = mmdet_dir
 
-dataset = obj_from_dict(cfg.data.train, datasets, dict(test_mode=False))    
+batch_size = 3
+
+dataset = obj_from_dict(cfg.data.train, datasets, dict(test_mode=False))
 data_loader = build_dataloader(
     dataset,
-    imgs_per_gpu=1,
+    imgs_per_gpu=batch_size,
     workers_per_gpu=cfg.data.workers_per_gpu,
     num_gpus=1,
     dist=False,
@@ -106,9 +119,17 @@ data_loader = build_dataloader(
 
 tracker = Tracker(cfg)
 dataset = data_loader.dataset
+loss = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(tracker.parameters(), lr=0.007)
 for i, data in enumerate(data_loader):
-    img_meta = data['img_meta'].data[0]
     img = data['img'].data[0].cuda()
-    pred = tracker(img, img_meta)
-    break
-    
+    bbox_pred = np.array([[[0, 100, 100, 50, 50]],[[1, 200, 200, 40, 40]], [[2, 100, 100, 30, 30]]])
+    bbox_pred = torch.Tensor(bbox_pred).cuda()
+
+    target = torch.empty(5, dtype=torch.long).random_(2).cuda()
+
+    pred = tracker(img, bbox_pred)
+    if pred is not None:
+        output = loss(pred, target)
+        output.backward()
+        optimizer.step()
